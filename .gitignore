@@ -1,0 +1,12 @@
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Build output (build.sh copies the app here; releases are zipped from it)
+ClaudeUsage.app/
+*.zip
+
+# macOS
+.DS_Store

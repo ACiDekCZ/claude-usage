@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""clu — print current Claude usage.
+
+Prints the three figures that matter by default; --full for the detail.
+
+Wraps `claude -p /usage`, which reports the plan limits straight from the
+server, and adds the pacing figure: where an even spread across the week
+would have you right now.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+DAILY_RATION = 100.0 / 7.0  # a day's share of the weekly limit
+
+SESSION_RE = re.compile(r"^Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*(.+))?$")
+WEEK_RE = re.compile(r"^Current week \(([^)]+)\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*(.+))?$")
+# "Aug 12 at 1:59pm (Europe/Prague)" — minutes are dropped on the hour ("11am").
+RESET_RE = re.compile(
+    r"^(\w{3})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)$",
+    re.IGNORECASE)
+
+
+class Colour:
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def __call__(self, text, code):
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def dim(self, t):
+        return self(t, "2")
+
+    def bold(self, t):
+        return self(t, "1")
+
+    def green(self, t):
+        return self(t, "32")
+
+    def orange(self, t):
+        return self(t, "33")
+
+    def red(self, t):
+        return self(t, "31")
+
+
+def run_claude(timeout):
+    """Return the raw text of `claude -p /usage`."""
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "/usage"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        sys.exit("clu: `claude` not found on PATH")
+    except subprocess.TimeoutExpired:
+        sys.exit(f"clu: `claude -p /usage` timed out after {timeout}s")
+    if proc.returncode != 0:
+        sys.exit(f"clu: `claude -p /usage` failed ({proc.returncode})\n{proc.stderr.strip()}")
+    return proc.stdout
+
+
+def parse_reset(text, now):
+    """'Aug 12 at 1:59pm (Europe/Prague)' -> aware datetime, or None."""
+    if not text:
+        return None
+    m = RESET_RE.match(text.strip())
+    if not m:
+        return None
+    month, day, hour, minute, ampm, tzname = m.groups()
+    minute = int(minute or 0)
+    hour = int(hour) % 12 + (12 if ampm.lower() == "pm" else 0)
+    try:
+        tz = ZoneInfo(tzname)
+        month_num = datetime.strptime(month, "%b").month
+    except (KeyError, ValueError):
+        return None
+
+    ref = now.astimezone(tz)
+    for year in (ref.year, ref.year + 1, ref.year - 1):
+        try:
+            dt = datetime(year, month_num, int(day), hour, minute, tzinfo=tz)
+        except ValueError:
+            continue
+        # Resets are always ahead of now, but allow a little slack for clock skew.
+        if dt > ref - timedelta(days=1):
+            return dt
+    return None
+
+
+def parse(text, now):
+    data = {"session": None, "limits": [], "raw": text}
+    for line in text.splitlines():
+        line = line.strip()
+        m = SESSION_RE.match(line)
+        if m:
+            data["session"] = {
+                "percent": int(m.group(1)),
+                "reset": parse_reset(m.group(2), now),
+                "reset_text": (m.group(2) or "").strip() or None,
+            }
+            continue
+        m = WEEK_RE.match(line)
+        if m:
+            data["limits"].append({
+                "name": m.group(1),
+                "percent": int(m.group(2)),
+                "reset": parse_reset(m.group(3), now),
+                "reset_text": (m.group(3) or "").strip() or None,
+            })
+    return data
+
+
+def compact_duration(delta):
+    total = max(0, int(delta.total_seconds()))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def pace(week, now):
+    """Where an even spread would have you, and how far off you are."""
+    if not week or not week["reset"]:
+        return None
+    reset = week["reset"]
+    start = reset - timedelta(days=7)
+    elapsed = (now.astimezone(reset.tzinfo) - start).total_seconds() / (7 * 86400)
+    elapsed = min(1.0, max(0.0, elapsed)) * 100
+    return {"expected": elapsed, "ahead": week["percent"] - elapsed}
+
+
+def colour_for_ahead(ahead, c):
+    """Same rule as the menu bar app: red past +3, orange anywhere ahead,
+    green once a full day's ration or more behind."""
+    if ahead > 3:
+        return c.red
+    if ahead > 0:
+        return c.orange
+    if ahead < -DAILY_RATION:
+        return c.green
+    return lambda t: t
+
+
+def colour_for_usage(percent, c):
+    if percent >= 95:
+        return c.red
+    if percent >= 90:
+        return c.orange
+    return lambda t: t
+
+
+def bar(percent, width, c):
+    filled = max(0, min(width, round(percent / 100 * width)))
+    return c.dim("█" * filled + "·" * (width - filled))
+
+
+def render_short(data, now, c):
+    """Three lines: what you've used, where you should be, and the session."""
+    week = next((l for l in data["limits"] if "all models" in l["name"].lower()), None)
+    if not week:
+        sys.exit("clu: no weekly limit in claude's output")
+
+    lines = [colour_for_usage(week["percent"], c)(f"{week['percent']}% used")]
+
+    p = pace(week, now)
+    if p:
+        lines.append(colour_for_ahead(p["ahead"], c)(
+            f"{round(p['expected'])}% of week gone"))
+
+    # Appended last on purpose: anything reading the first two lines by
+    # position keeps working.
+    session = data.get("session")
+    if session:
+        line = colour_for_usage(session["percent"], c)(
+            f"{session['percent']}% of session used")
+        if session["reset"]:
+            left = compact_duration(
+                session["reset"] - now.astimezone(session["reset"].tzinfo))
+            line += c.dim(f" · resets in {left}")
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def render_full(data, now, c):
+    lines = []
+    week = next((l for l in data["limits"] if "all models" in l["name"].lower()), None)
+
+    rows = []
+    if data["session"]:
+        rows.append(("Session", data["session"]))
+    for limit in data["limits"]:
+        label = "Week" if limit is week else limit["name"]
+        rows.append((label, limit))
+
+    width = max((len(r[0]) for r in rows), default = 0)
+    for label, item in rows:
+        pct = item["percent"]
+        cell = colour_for_usage(pct, c)(f"{pct:3d}%")
+        line = f"{label.ljust(width)}  {cell}  {bar(pct, 16, c)}"
+        if item["reset"]:
+            left = compact_duration(item["reset"] - now.astimezone(item["reset"].tzinfo))
+            stamp = item["reset"].strftime("%a %-d %b, %H:%M")
+            line += "  " + c.dim(f"resets in {left}  ({stamp})")
+        lines.append(line)
+
+    p = pace(week, now)
+    if p:
+        tint = colour_for_ahead(p["ahead"], c)
+        verdict = (f"{p['ahead']:.1f}% ahead of the line" if p["ahead"] > 0
+                   else f"{abs(p['ahead']):.1f}% behind the line")
+        expected = tint(f"{p['expected']:.1f}%")
+        lines.append("")
+        lines.append(f"{'Pace'.ljust(width)}  {week['percent']:3d}% used vs {expected} "
+                     f"of the week gone  {tint(verdict)}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="clu", description="Print current Claude usage.")
+    ap.add_argument("--full", "--long", action="store_true", dest="full",
+                    help="every limit, with bars, reset times and the pace line")
+    ap.add_argument("--raw", action="store_true",
+                    help="print `claude -p /usage` output unchanged")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--timeout", type=int, default=60,
+                    help="seconds to wait for claude (default 60)")
+    args = ap.parse_args()
+
+    text = run_claude(args.timeout)
+    if args.raw:
+        sys.stdout.write(text)
+        return
+
+    now = datetime.now().astimezone()
+    data = parse(text, now)
+    if data["session"] is None and not data["limits"]:
+        sys.stderr.write("clu: could not find usage figures in claude's output\n")
+        sys.stdout.write(text)
+        sys.exit(1)
+
+    if args.json:
+        week = next((l for l in data["limits"] if "all models" in l["name"].lower()), None)
+        p = pace(week, now)
+        out = {
+            "session": _jsonable(data["session"]),
+            "limits": [_jsonable(l) for l in data["limits"]],
+            "pace": p,
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    c = Colour(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
+    print(render_full(data, now, c) if args.full else render_short(data, now, c))
+
+
+def _jsonable(item):
+    if item is None:
+        return None
+    out = dict(item)
+    out["reset"] = item["reset"].isoformat() if item["reset"] else None
+    return out
+
+
+if __name__ == "__main__":
+    main()
