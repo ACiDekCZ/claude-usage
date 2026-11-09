@@ -136,46 +136,108 @@ enum ClaudeCLI {
         ])
     }
 
-    static func usageText(timeout: TimeInterval = 60) async throws -> String {
+    /// Generous: besides the limits, `/usage` now sums up the local session
+    /// history ("What's contributing to your usage?"), which on a busy Mac
+    /// takes minutes rather than seconds.
+    static func usageText(for account: ClaudeAccount, timeout: TimeInterval = 300) async throws -> String {
         guard let binary = locate() else { throw Subprocess.Failure.notFound("claude CLI") }
         return try await Subprocess.run(binary, ["-p", "/usage"],
                                        workingDirectory: Subprocess.scratchDirectory("cli"),
+                                       environment: account.cliEnvironment,
                                        timeout: timeout)
+    }
+}
+
+/// Everything shown for one account: its figures, how old they are, and
+/// what went wrong reading them.
+struct AccountUsage: Identifiable {
+    var account: ClaudeAccount
+    var id: String { account.id }
+
+    var isLoggedIn = false
+    var usageData: UsageData?
+    /// Weekly usage. Neutral until it passes 90 % of the weekly limit.
+    var displayPrimary = "..."
+    var displayPrimaryStatus: PaceStatus = .unknown
+    /// Share of the week elapsed — the only part tinted by pace.
+    var displayPace: String?
+    /// Pace bucket `displayPace` is tinted with.
+    var displayStatus: PaceStatus = .unknown
+    var lastUpdate: Date?
+    var errorMessage: String?
+    /// True while a read is in flight. The figures stay up throughout.
+    var isFetching = false
+    /// Whether `displayPrimary` holds real figures, however old.
+    var hasFigures = false
+
+    /// Past this, the figures on screen are shown dimmed: still the best we
+    /// have, but no longer current. Three missed refreshes.
+    static let staleAfterSeconds: TimeInterval = 15 * 60
+
+    var isStale: Bool {
+        guard let lastUpdate else { return false }
+        return Date().timeIntervalSince(lastUpdate) > Self.staleAfterSeconds
+    }
+
+    init(account: ClaudeAccount) {
+        self.account = account
+    }
+
+    mutating func setStatus(_ text: String,
+                            primaryStatus: PaceStatus = .unknown,
+                            pace: String? = nil,
+                            status: PaceStatus = .unknown) {
+        displayPrimary = text
+        displayPrimaryStatus = primaryStatus
+        displayPace = pace
+        displayStatus = status
+    }
+
+    /// A failed read doesn't make the figures we already have wrong, so leave
+    /// them up — the menu carries the error. Only say "!" when we have nothing.
+    mutating func markFailed(_ message: String? = nil) {
+        if let message { errorMessage = message }
+        guard !hasFigures else { return }
+        setStatus("!")
     }
 }
 
 @MainActor
 class UsageManager: NSObject, ObservableObject {
-    @Published var isLoggedIn = false
-    @Published var usageData: UsageData?
-    /// Weekly usage. Neutral until it passes 80 % of the weekly limit.
-    @Published var displayPrimary = "..."
-    @Published var displayPrimaryStatus: PaceStatus = .unknown
-    /// Pace against today's budget — the only part that gets tinted.
-    @Published var displayPace: String?
-    @Published var lastUpdate: Date?
-    @Published var errorMessage: String?
+    static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+    /// The standard account always comes first, and the claude.ai fallback
+    /// is tied to it.
+    static let defaultID = "default"
+
+    /// Every account found, in display order — the standard one first.
+    @Published private(set) var accounts: [AccountUsage] = []
     @Published var autoRefresh = true
-    /// Pace bucket the menu bar title is tinted with.
-    @Published var displayStatus: PaceStatus = .unknown
-    /// True while a read is in flight. The figures stay up throughout.
-    @Published private(set) var isFetching = false
-    /// Whether `displayPrimary` holds real figures, however old.
-    @Published private(set) var hasFigures = false
+    /// Accounts left out of the menu bar title. They stay in the menu.
+    @Published private(set) var hiddenInMenuBar: Set<String> = []
+    @Published private(set) var isAddingAccount = false
 
-    /// Past this, the figures on screen are shown dimmed: still the best we
-    /// have, but no longer current. Three missed refreshes.
-    private let staleAfterSeconds: TimeInterval = 15 * 60
+    var isFetching: Bool { accounts.contains { $0.isFetching } }
+    var isLoggedIn: Bool { accounts.contains { $0.isLoggedIn } }
+    var hasMultipleAccounts: Bool { accounts.count > 1 }
 
-    var isStale: Bool {
-        guard let lastUpdate else { return false }
-        return Date().timeIntervalSince(lastUpdate) > staleAfterSeconds
+    /// The accounts the menu bar title shows, in order.
+    var menuBarAccounts: [AccountUsage] {
+        accounts.filter { !hiddenInMenuBar.contains($0.id) }
     }
+
+    /// When the oldest figures on screen were read.
+    var lastUpdate: Date? {
+        accounts.filter(\.hasFigures).compactMap(\.lastUpdate).min()
+    }
+
+    /// Whether any figure in the menu bar has gone stale.
+    var isStale: Bool { menuBarAccounts.contains { $0.isStale } }
 
     private var refreshTimer: Timer?
     private let usageURL = URL(string: "https://claude.ai/settings/usage")!
     private let loginURL = URL(string: "https://claude.ai/login")!
-    private let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    private let userAgent = UsageManager.userAgent
 
     // Skip refresh when user has been idle (no mouse/keyboard) for this long.
     private let idleThresholdSeconds: TimeInterval = 600
@@ -191,12 +253,14 @@ class UsageManager: NSObject, ObservableObject {
     private var loginWindow: NSWindow?
     private var loginWebView: WKWebView?
     private var didImportCookies = false
+    private let accountLogin = AccountLogin()
 
     override init() {
         super.init()
         try? FileManager.default.removeItem(atPath: DebugLog.path)
         DebugLog.log("=== ClaudeUsage launched ===")
-        restoreLastDisplay()
+        hiddenInMenuBar = Set(UserDefaults.standard.stringArray(forKey: Self.hiddenKey) ?? [])
+        refreshAccounts()
         setupFetchWebView()
         setupActivityObservers()
         DebugLog.log("claude CLI: \(ClaudeCLI.locate()?.path ?? "not found")")
@@ -208,6 +272,115 @@ class UsageManager: NSObject, ObservableObject {
     deinit {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
+
+    // MARK: - Accounts
+
+    func state(_ id: String) -> AccountUsage? {
+        accounts.first { $0.id == id }
+    }
+
+    private func update(_ id: String, _ change: (inout AccountUsage) -> Void) {
+        guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
+        change(&accounts[index])
+    }
+
+    /// Looks for accounts again — a folder may have been signed in or out
+    /// since — keeping the figures of the ones still there.
+    private func refreshAccounts() {
+        let found = AccountDiscovery.discover()
+        let snapshots = loadSnapshots()
+        let updated = found.map { account -> AccountUsage in
+            if var existing = state(account.id) {
+                existing.account = account
+                return existing
+            }
+            var fresh = AccountUsage(account: account)
+            if let snapshot = snapshots[account.id] {
+                fresh.setStatus(snapshot.primary,
+                                primaryStatus: snapshot.primaryStatus,
+                                pace: snapshot.pace,
+                                status: snapshot.status)
+                fresh.lastUpdate = snapshot.updatedAt
+                fresh.hasFigures = true
+                DebugLog.log("restored last display for \(account.label): \(snapshot.primary) (read \(snapshot.updatedAt))")
+            }
+            return fresh
+        }
+        if updated.map(\.id) != accounts.map(\.id) {
+            DebugLog.log("accounts: \(found.map { "\($0.label) [\($0.configDir?.path ?? "~/.claude")]" }.joined(separator: ", "))")
+        }
+        accounts = updated
+    }
+
+    func toggleMenuBar(_ id: String) {
+        if hiddenInMenuBar.contains(id) { hiddenInMenuBar.remove(id) } else { hiddenInMenuBar.insert(id) }
+        UserDefaults.standard.set(Array(hiddenInMenuBar), forKey: Self.hiddenKey)
+    }
+
+    private static let hiddenKey = "hiddenInMenuBar"
+
+    /// Signs a further account in through `claude auth login`, into a config
+    /// folder of the app's own — see `AccountLogin`.
+    func addAccount() {
+        let existing = Set(accounts.compactMap { $0.account.email?.lowercased() })
+        isAddingAccount = true
+        accountLogin.start(existingEmails: existing) { [weak self] outcome in
+            guard let self else { return }
+            self.isAddingAccount = false
+            switch outcome {
+            case .added(let email):
+                DebugLog.log("add account: added \(email)")
+                self.refreshAccounts()
+                if let account = self.accounts.last(where: { $0.account.kind == .managed && $0.account.email == email })?.account {
+                    self.lastFetchAt = Date()
+                    Task { await self.fetch(account) }
+                }
+            case .duplicate(let email):
+                Self.alert("\(email) is already listed",
+                           "Each account is shown once; this sign-in was undone.")
+            case .cancelled:
+                break
+            case .failed(let message):
+                Self.alert("The account wasn't added", message)
+            }
+        }
+    }
+
+    /// Only an account the app added can be removed — the folders it found
+    /// belong to the user, and the menu bar is the place to hide those.
+    func removeAccount(_ id: String) {
+        guard let account = state(id)?.account, account.kind == .managed,
+              let dir = account.configDir else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Remove \(account.label)?"
+        alert.informativeText = "Claude Usage signs this account out and stops showing it. Other Claude Code logins are not affected."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        Task { @MainActor in
+            await AccountLogin.discard(dir)
+            var snapshots = loadSnapshots()
+            snapshots[id] = nil
+            saveSnapshots(snapshots)
+            hiddenInMenuBar.remove(id)
+            UserDefaults.standard.set(Array(hiddenInMenuBar), forKey: Self.hiddenKey)
+            refreshAccounts()
+            DebugLog.log("removed account \(account.label)")
+        }
+    }
+
+    private static func alert(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    // MARK: - Activity
 
     private func setupActivityObservers() {
         let nc = NSWorkspace.shared.notificationCenter
@@ -261,10 +434,12 @@ class UsageManager: NSObject, ObservableObject {
         fetchWebView.navigationDelegate = self
     }
 
-    /// The last figures we managed to read. A refresh takes seconds and the
-    /// menu bar used to go blank for the whole of it — and blank again after
-    /// every restart. Old numbers beat no numbers, so they are kept on screen
-    /// and written to disk, dimmed once they go stale.
+    // MARK: - Last figures
+
+    /// The last figures we managed to read, per account. A refresh takes
+    /// seconds and the menu bar used to go blank for the whole of it — and
+    /// blank again after every restart. Old numbers beat no numbers, so they
+    /// are kept on screen and written to disk, dimmed once they go stale.
     private struct Snapshot: Codable {
         let primary: String
         let primaryStatus: PaceStatus
@@ -273,53 +448,49 @@ class UsageManager: NSObject, ObservableObject {
         let updatedAt: Date
     }
 
-    private static let snapshotKey = "lastDisplay"
+    private static let snapshotsKey = "lastDisplays"
+    /// Where a single account's figures were kept before there could be more.
+    private static let legacySnapshotKey = "lastDisplay"
 
-    private func saveLastDisplay() {
-        guard hasFigures, let lastUpdate else { return }
-        let snapshot = Snapshot(primary: displayPrimary,
-                                primaryStatus: displayPrimaryStatus,
-                                pace: displayPace,
-                                status: displayStatus,
-                                updatedAt: lastUpdate)
-        if let data = try? JSONEncoder().encode(snapshot) {
-            UserDefaults.standard.set(data, forKey: Self.snapshotKey)
+    private func loadSnapshots() -> [String: Snapshot] {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: Self.snapshotsKey),
+           let snapshots = try? JSONDecoder().decode([String: Snapshot].self, from: data) {
+            return snapshots
+        }
+        if let data = defaults.data(forKey: Self.legacySnapshotKey),
+           let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) {
+            return [Self.defaultID: snapshot]
+        }
+        return [:]
+    }
+
+    private func saveSnapshots(_ snapshots: [String: Snapshot]) {
+        if let data = try? JSONEncoder().encode(snapshots) {
+            UserDefaults.standard.set(data, forKey: Self.snapshotsKey)
+            UserDefaults.standard.removeObject(forKey: Self.legacySnapshotKey)
         }
     }
 
-    private func restoreLastDisplay() {
-        guard let data = UserDefaults.standard.data(forKey: Self.snapshotKey),
-              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
-        setStatus(snapshot.primary,
-                  primaryStatus: snapshot.primaryStatus,
-                  pace: snapshot.pace,
-                  status: snapshot.status)
-        lastUpdate = snapshot.updatedAt
-        hasFigures = true
-        DebugLog.log("restored last display: \(snapshot.primary) (read \(snapshot.updatedAt))")
+    private func saveLastDisplay(_ id: String) {
+        guard let state = state(id), state.hasFigures, let lastUpdate = state.lastUpdate else { return }
+        var snapshots = loadSnapshots()
+        snapshots[id] = Snapshot(primary: state.displayPrimary,
+                                 primaryStatus: state.displayPrimaryStatus,
+                                 pace: state.displayPace,
+                                 status: state.displayStatus,
+                                 updatedAt: lastUpdate)
+        saveSnapshots(snapshots)
     }
 
-    private func forgetLastDisplay() {
-        UserDefaults.standard.removeObject(forKey: Self.snapshotKey)
-        hasFigures = false
-        lastUpdate = nil
-    }
-
-    /// A failed read doesn't make the figures we already have wrong, so leave
-    /// them up — the menu carries the error. Only say "!" when we have nothing.
-    private func markFailed() {
-        guard !hasFigures else { return }
-        setStatus("!")
-    }
-
-    private func setStatus(_ text: String,
-                           primaryStatus: PaceStatus = .unknown,
-                           pace: String? = nil,
-                           status: PaceStatus = .unknown) {
-        displayPrimary = text
-        displayPrimaryStatus = primaryStatus
-        displayPace = pace
-        displayStatus = status
+    private func forgetLastDisplay(_ id: String) {
+        var snapshots = loadSnapshots()
+        snapshots[id] = nil
+        saveSnapshots(snapshots)
+        update(id) {
+            $0.hasFigures = false
+            $0.lastUpdate = nil
+        }
     }
 
     // MARK: - Public actions
@@ -327,28 +498,83 @@ class UsageManager: NSObject, ObservableObject {
     /// Prefers the Claude Code CLI: `claude -p /usage` reports the plan limits
     /// straight from the server, costs nothing (no model call — measured at zero
     /// tokens and zero turns), needs no cookies, and gives the reset moment as a
-    /// real date with a timezone instead of a bare weekday. Falls back to
-    /// scraping the settings page if the CLI isn't usable.
+    /// real date with a timezone instead of a bare weekday. Every account is
+    /// read this way, one after another — each run walks the local session
+    /// history, and several at once only slow each other down. Only the
+    /// standard one falls back to scraping the settings page if the CLI isn't
+    /// usable.
     func fetchUsage() {
         guard !isFetching else {
             DebugLog.log("fetchUsage skipped, already fetching")
             return
         }
-        isFetching = true
-        errorMessage = nil
+        refreshAccounts()
         lastFetchAt = Date()
-
-        Task { @MainActor in
-            do {
-                let text = try await ClaudeCLI.usageText()
-                isFetching = false
-                if parseCLIOutput(text) { return }
-                DebugLog.log("CLI output had no usage figures, falling back to web")
-            } catch {
-                DebugLog.log("CLI unavailable (\(error.localizedDescription)), falling back to web")
-            }
-            fetchUsageViaWeb()
+        let queue = accounts.map(\.account)
+        for account in queue {
+            update(account.id) { $0.isFetching = true }
         }
+        Task { @MainActor in
+            for account in queue {
+                await fetch(account)
+            }
+        }
+    }
+
+    private func fetch(_ account: ClaudeAccount) async {
+        let id = account.id
+        update(id) {
+            $0.isFetching = true
+            $0.errorMessage = nil
+        }
+
+        var failure: String
+        do {
+            let text = try await ClaudeCLI.usageText(for: account)
+            update(id) { $0.isFetching = false }
+            if let data = parseCLIOutput(text) {
+                publish(data, for: id, source: "cli")
+                return
+            }
+            DebugLog.log("CLI output for \(account.label) had no usage figures: \(String(text.prefix(200)))")
+            failure = Self.cliProblem(in: text)
+        } catch Subprocess.Failure.timedOut(let tool, let after) {
+            // Slow, not broken: claude.ai wouldn't do better, so keep what we
+            // have and try again next round.
+            update(id) {
+                $0.isFetching = false
+                $0.markFailed("\(tool) took longer than \(Int(after)) s")
+            }
+            DebugLog.log("CLI timed out for \(account.label) after \(Int(after)) s")
+            return
+        } catch {
+            update(id) { $0.isFetching = false }
+            DebugLog.log("CLI unavailable for \(account.label) (\(error.localizedDescription))")
+            failure = error.localizedDescription
+        }
+
+        if account.kind == .standard {
+            DebugLog.log("falling back to web")
+            fetchUsageViaWeb()
+        } else {
+            update(id) { $0.markFailed(failure) }
+        }
+    }
+
+    /// A short reason for output that carried no figures.
+    private static func cliProblem(in text: String) -> String {
+        let lower = text.lowercased()
+        if lower.contains("log in") || lower.contains("login") || lower.contains("not logged") {
+            return "Not signed in"
+        }
+        let firstLine = text.split(separator: "\n").first.map(String.init) ?? ""
+        return firstLine.isEmpty ? "claude gave no usage figures" : String(firstLine.prefix(80))
+    }
+
+    /// Whether the standard account's claude.ai read is in flight.
+    private var webFetching: Bool {
+        get { state(Self.defaultID)?.isFetching ?? false }
+        set { update(Self.defaultID) { $0.isFetching = newValue } }
     }
 
     private func fetchUsageViaWeb() {
@@ -359,18 +585,17 @@ class UsageManager: NSObject, ObservableObject {
                 didImportCookies = true
                 await importFromChromeIfNeeded(silentOnSuccess: true)
             }
-            guard !isFetching else { return }
+            guard !webFetching else { return }
             DebugLog.log("fetchUsage via web -> \(usageURL.absoluteString)")
-            isFetching = true
+            webFetching = true
             pollAttempts = 0
-            lastFetchAt = Date()
             fetchWebView.load(URLRequest(url: usageURL))
         }
     }
 
     func importFromChrome() {
         Task { @MainActor in
-            errorMessage = nil
+            update(Self.defaultID) { $0.errorMessage = nil }
             let ok = await importFromChromeIfNeeded(silentOnSuccess: false)
             if ok {
                 fetchUsage()
@@ -400,8 +625,7 @@ class UsageManager: NSObject, ObservableObject {
         case .failure(let err):
             DebugLog.log("Chrome import failed: \(err.localizedDescription)")
             if !silentOnSuccess {
-                self.errorMessage = err.localizedDescription
-                self.markFailed()
+                update(Self.defaultID) { $0.markFailed(err.localizedDescription) }
             }
             return false
         }
@@ -464,6 +688,8 @@ class UsageManager: NSObject, ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Clears the claude.ai session the fallback reads with, and the standard
+    /// account's figures along with it.
     func logout() {
         let dataStore = WKWebsiteDataStore.default()
         let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
@@ -472,11 +698,13 @@ class UsageManager: NSObject, ObservableObject {
         dataStore.removeData(ofTypes: dataTypes, modifiedSince: date) { [weak self] in
             Task { @MainActor in
                 guard let self = self else { return }
-                self.isLoggedIn = false
-                self.usageData = nil
-                self.setStatus("...")
-                self.forgetLastDisplay()
-                self.stopRefreshTimer()
+                self.update(Self.defaultID) {
+                    $0.isLoggedIn = false
+                    $0.usageData = nil
+                    $0.setStatus("...")
+                }
+                self.forgetLastDisplay(Self.defaultID)
+                if !self.isLoggedIn { self.stopRefreshTimer() }
             }
         }
     }
@@ -484,8 +712,7 @@ class UsageManager: NSObject, ObservableObject {
     // MARK: - Auto-refresh
 
     func startRefreshTimer() {
-        guard autoRefresh else { return }
-        refreshTimer?.invalidate()
+        guard autoRefresh, refreshTimer == nil else { return }
         refreshTimer = Timer.scheduledTimer(withTimeInterval: tickIntervalSeconds, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.timerTick()
@@ -522,12 +749,12 @@ class UsageManager: NSObject, ObservableObject {
     // MARK: - Page text extraction
 
     private func pollForContent() {
-        guard isFetching else { return }
+        guard webFetching else { return }
 
         fetchWebView.evaluateJavaScript("document.body ? document.body.innerText : ''") { [weak self] result, error in
             Task { @MainActor in
                 guard let self = self else { return }
-                guard self.isFetching else { return }
+                guard self.webFetching else { return }
 
                 let text = (result as? String) ?? ""
                 let lower = text.lowercased()
@@ -538,7 +765,7 @@ class UsageManager: NSObject, ObservableObject {
 
                 if looksLikeUsage || looksLikeLogin {
                     DebugLog.log("pollForContent matched after \(self.pollAttempts) tries (usage=\(looksLikeUsage), login=\(looksLikeLogin)), text length=\(text.count), url=\(self.fetchWebView.url?.absoluteString ?? "nil")")
-                    self.isFetching = false
+                    self.webFetching = false
                     self.parseUsageText(text)
                     return
                 }
@@ -546,9 +773,10 @@ class UsageManager: NSObject, ObservableObject {
                 self.pollAttempts += 1
                 if self.pollAttempts >= self.maxPollAttempts {
                     DebugLog.log("pollForContent gave up after \(self.pollAttempts) tries; url=\(self.fetchWebView.url?.absoluteString ?? "nil"); text length=\(text.count); first 200: \(String(text.prefix(200)))")
-                    self.isFetching = false
-                    self.markFailed()
-                    self.errorMessage = "Page didn't load — check /tmp/claude-usage-debug.log"
+                    self.webFetching = false
+                    self.update(Self.defaultID) {
+                        $0.markFailed("Page didn't load — check /tmp/claude-usage-debug.log")
+                    }
                     return
                 }
 
@@ -567,14 +795,12 @@ class UsageManager: NSObject, ObservableObject {
         let lowerText = text.lowercased()
         if lowerText.contains("continue with google") || lowerText.contains("continue with email") ||
            lowerText.contains("log in to claude") {
-            isLoggedIn = false
-            markFailed()
-            errorMessage = "Not logged in"
+            update(Self.defaultID) {
+                $0.isLoggedIn = false
+                $0.markFailed("Not logged in")
+            }
             return
         }
-
-        isLoggedIn = true
-        startRefreshTimer()
 
         let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
 
@@ -651,7 +877,7 @@ class UsageManager: NSObject, ObservableObject {
         }
 
         applyPacing(to: &data, now: now)
-        publish(data, source: "web")
+        publish(data, for: Self.defaultID, source: "web")
     }
 
     /// Derives everything the display needs from the weekly reset moment.
@@ -686,26 +912,36 @@ class UsageManager: NSObject, ObservableObject {
         }
     }
 
-    private func publish(_ data: UsageData, source: String) {
-        DebugLog.log("Parsed[\(source)] - Current: \(data.currentSessionPercent ?? -1)% (reset: \(data.currentSessionReset ?? "?")), All: \(data.allModelsPercent ?? -1)% (reset: \(data.allModelsReset ?? "?")), \(data.sonnetLabel ?? "other"): \(data.sonnetPercent ?? -1)%, day \(data.weekDayIndex ?? -1)/7 (\(data.dayProgressPercent ?? -1)% in), expected \(data.expectedPercent ?? -1)%, ahead \(data.dayDeviationPercent ?? 0)%, status \(data.paceStatus)")
+    private func publish(_ data: UsageData, for id: String, source: String) {
+        DebugLog.log("Parsed[\(source), \(state(id)?.account.label ?? id)] - Current: \(data.currentSessionPercent ?? -1)% (reset: \(data.currentSessionReset ?? "?")), All: \(data.allModelsPercent ?? -1)% (reset: \(data.allModelsReset ?? "?")), \(data.sonnetLabel ?? "other"): \(data.sonnetPercent ?? -1)%, day \(data.weekDayIndex ?? -1)/7 (\(data.dayProgressPercent ?? -1)% in), expected \(data.expectedPercent ?? -1)%, ahead \(data.dayDeviationPercent ?? 0)%, status \(data.paceStatus)")
 
-        if let all = data.allModelsPercent {
-            setStatus(String(format: "%.0f%%", all),
-                      // Neutral until the weekly figure is itself close to
-                      // running out: orange from 90 %, red from 95 %.
-                      primaryStatus: PaceStatus(percentOfLimit: all,
-                                                warn: 90, danger: 95, green: false),
-                      pace: data.expectedPercent.map { String(format: "%.0f%%", $0) },
-                      status: data.paceStatus)
-        } else {
-            setStatus("?")
+        // A read that found no weekly figure says nothing new; it mustn't
+        // wipe the figures already on screen.
+        if data.allModelsPercent == nil, state(id)?.hasFigures == true {
+            update(id) { $0.markFailed("No usage figures in the \(source) read") }
+            return
         }
 
-        usageData = data
-        lastUpdate = Date()
-        errorMessage = nil
-        hasFigures = data.allModelsPercent != nil
-        saveLastDisplay()
+        update(id) { state in
+            if let all = data.allModelsPercent {
+                state.setStatus(String(format: "%.0f%%", all),
+                                // Neutral until the weekly figure is itself close to
+                                // running out: orange from 90 %, red from 95 %.
+                                primaryStatus: PaceStatus(percentOfLimit: all,
+                                                          warn: 90, danger: 95, green: false),
+                                pace: data.expectedPercent.map { String(format: "%.0f%%", $0) },
+                                status: data.paceStatus)
+            } else {
+                state.setStatus("?")
+            }
+            state.isLoggedIn = true
+            state.usageData = data
+            state.lastUpdate = Date()
+            state.errorMessage = nil
+            state.hasFigures = data.allModelsPercent != nil
+        }
+        saveLastDisplay(id)
+        startRefreshTimer()
     }
 
     // MARK: - CLI parsing
@@ -716,8 +952,8 @@ class UsageManager: NSObject, ObservableObject {
     ///     Current week (all models): 9% used · resets Aug 12 at 2pm (Europe/Prague)
     ///     Current week (Fable): 0% used
     ///
-    /// Returns false if none of them were found, so the caller can fall back.
-    private func parseCLIOutput(_ text: String) -> Bool {
+    /// Returns nil if none of them were found, so the caller can fall back.
+    private func parseCLIOutput(_ text: String) -> UsageData? {
         var data = UsageData()
         data.rawText = text
 
@@ -741,18 +977,14 @@ class UsageManager: NSObject, ObservableObject {
             }
         }
 
-        guard data.allModelsPercent != nil || data.currentSessionPercent != nil else { return false }
-
-        isLoggedIn = true
-        startRefreshTimer()
+        guard data.allModelsPercent != nil || data.currentSessionPercent != nil else { return nil }
 
         let now = Date()
         data.currentSessionResetDate = data.currentSessionReset.flatMap { Self.parseCLIReset($0, now: now) }
         data.allModelsResetDate = data.allModelsReset.flatMap { Self.parseCLIReset($0, now: now) }
 
         applyPacing(to: &data, now: now)
-        publish(data, source: "cli")
-        return true
+        return data
     }
 
     /// "Aug 12 at 2pm (Europe/Prague)" — minutes are dropped on the hour, and the
@@ -884,18 +1116,16 @@ extension UsageManager: WKNavigationDelegate {
     nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         Task { @MainActor in
             guard webView === self.fetchWebView else { return }
-            self.isFetching = false
-            self.markFailed()
-            self.errorMessage = error.localizedDescription
+            self.webFetching = false
+            self.update(Self.defaultID) { $0.markFailed(error.localizedDescription) }
         }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         Task { @MainActor in
             guard webView === self.fetchWebView else { return }
-            self.isFetching = false
-            self.markFailed()
-            self.errorMessage = error.localizedDescription
+            self.webFetching = false
+            self.update(Self.defaultID) { $0.markFailed(error.localizedDescription) }
         }
     }
 }

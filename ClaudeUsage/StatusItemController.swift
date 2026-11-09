@@ -60,38 +60,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.image?.isTemplate = true
         button.imagePosition = .imageLeading
 
+        // One "used·elapsed" pair per account, in the menu's order.
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let title = NSMutableAttributedString()
+        for (index, state) in manager.menuBarAccounts.enumerated() {
+            if index > 0 {
+                title.append(NSAttributedString(
+                    string: " │",
+                    attributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor]
+                ))
+            }
+            title.append(Self.figures(state, font: font))
+        }
+        button.attributedTitle = title
+
+        let lines = manager.menuBarAccounts.map { state -> String in
+            let figures = state.displayPace.map {
+                "\(state.displayPrimary) used · \($0) of the week gone — \(state.displayStatus.label)"
+            } ?? state.displayPrimary
+            return manager.hasMultipleAccounts ? "\(state.account.label): \(figures)" : figures
+        }
+        button.toolTip = lines.isEmpty
+            ? "Claude usage"
+            : (lines + [Self.freshness(manager)]).joined(separator: "\n")
+    }
+
+    /// " 18%·31%" for one account. Only the deviation carries the colour —
+    /// weekly usage is just a fact, it's the distance from today's budget
+    /// that is good or bad.
+    private static func figures(_ state: AccountUsage, font: NSFont) -> NSAttributedString {
         // Old figures are still worth showing, just not at full strength.
         // Fresh ones are left exactly as they are — the system label colours
         // carry an alpha of their own, and forcing it to 1 blackens them.
         func tinted(_ color: NSColor) -> NSColor {
-            manager.isStale ? color.withAlphaComponent(0.45) : color
+            state.isStale ? color.withAlphaComponent(0.45) : color
         }
-
-        // Only the deviation carries the colour — weekly usage is just a fact,
-        // it's the distance from today's budget that is good or bad.
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        let title = NSMutableAttributedString(
-            string: " " + manager.displayPrimary,
+        let text = NSMutableAttributedString(
+            string: " " + state.displayPrimary,
             attributes: [.font: font,
-                         .foregroundColor: tinted(manager.displayPrimaryStatus.color)]
+                         .foregroundColor: tinted(state.displayPrimaryStatus.color)]
         )
-        if let pace = manager.displayPace {
-            title.append(NSAttributedString(
+        if let pace = state.displayPace {
+            text.append(NSAttributedString(
                 string: "·",
                 attributes: [.font: font,
                              .foregroundColor: tinted(.tertiaryLabelColor)]
             ))
-            title.append(NSAttributedString(
+            text.append(NSAttributedString(
                 string: pace,
                 attributes: [.font: font,
-                             .foregroundColor: tinted(manager.displayStatus.color)]
+                             .foregroundColor: tinted(state.displayStatus.color)]
             ))
         }
-        button.attributedTitle = title
-
-        button.toolTip = manager.displayPace == nil
-            ? "Claude usage"
-            : "Weekly used · share of the week elapsed (where you should be) — \(manager.displayStatus.label). \(Self.freshness(manager))"
+        return text
     }
 
     // MARK: - Menu
@@ -104,26 +125,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // run on a timer, and this is the moment the figures are wanted.
         ccusage.loadIfStale()
 
-        if manager.isLoggedIn, let usage = manager.usageData, let all = usage.allModelsPercent {
-            addPaceSection(to: menu, usage: usage, all: all)
-            addWeeklySection(to: menu, usage: usage, all: all)
-            addSessionSection(to: menu, usage: usage)
+        let multiple = manager.hasMultipleAccounts
+        var anyFigures = false
+        for (index, state) in manager.accounts.enumerated() {
+            if multiple {
+                if index > 0 { menu.addItem(.separator()) }
+                menu.addItem(.sectionHeader(title: state.account.label))
+            }
+            if state.isLoggedIn, let usage = state.usageData, let all = usage.allModelsPercent {
+                anyFigures = true
+                addPaceSection(to: menu, usage: usage, all: all, legend: !multiple)
+                addWeeklySection(to: menu, usage: usage, all: all)
+                addSessionSection(to: menu, usage: usage)
+            } else if state.account.kind == .standard {
+                menu.addItem(infoItem(state.errorMessage ?? (state.isFetching ? "Loading…" : "Not read yet"),
+                                      small: true))
+                // The claude.ai fallback only ever reads the standard account.
+                if !multiple { menu.addItem(.separator()) }
+                menu.addItem(actionItem("Import from Chrome", #selector(importFromChrome)))
+                menu.addItem(actionItem("Login in WebView…", #selector(showLogin)))
+            } else {
+                menu.addItem(infoItem(state.errorMessage ?? (state.isFetching ? "Loading…" : "Not read yet"),
+                                      small: true))
+            }
+        }
+        if multiple && anyFigures {
+            menu.addItem(infoItem(Self.legend, small: true))
+        }
 
-            menu.addItem(.separator())
-
-            menu.addItem(infoItem(Self.freshness(manager), small: true))
+        menu.addItem(.separator())
+        menu.addItem(infoItem(Self.freshness(manager), small: true))
+        if anyFigures {
             let toggle = actionItem("Auto-refresh", #selector(toggleAutoRefresh))
             toggle.state = manager.autoRefresh ? .on : .off
             menu.addItem(toggle)
-            menu.addItem(actionItem("Refresh", #selector(refresh), key: "r"))
-            menu.addItem(.separator())
+        }
+        menu.addItem(actionItem("Refresh", #selector(refresh), key: "r"))
+        menu.addItem(accountsItem(manager))
+        if manager.state(UsageManager.defaultID)?.isLoggedIn == true {
             menu.addItem(actionItem("Logout", #selector(logout)))
-        } else {
-            menu.addItem(infoItem(manager.errorMessage ?? "Loading…", small: true))
-            menu.addItem(.separator())
-            menu.addItem(actionItem("Import from Chrome", #selector(importFromChrome)))
-            menu.addItem(actionItem("Login in WebView…", #selector(showLogin)))
-            menu.addItem(actionItem("Refresh", #selector(refresh), key: "r"))
         }
 
         addSpendSection(to: menu)
@@ -139,8 +179,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(actionItem("Quit", #selector(quit), key: "q"))
     }
 
+    /// Accounts ▸ — which ones the menu bar shows, adding one, removing one
+    /// the app added.
+    private func accountsItem(_ manager: UsageManager) -> NSMenuItem {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        if manager.hasMultipleAccounts {
+            submenu.addItem(.sectionHeader(title: "Show in menu bar"))
+            for state in manager.accounts {
+                let item = actionItem(state.account.label, #selector(toggleMenuBar(_:)))
+                item.representedObject = state.id
+                item.state = manager.hiddenInMenuBar.contains(state.id) ? .off : .on
+                submenu.addItem(item)
+            }
+            submenu.addItem(.separator())
+        }
+
+        let add = actionItem(manager.isAddingAccount ? "Adding account…" : "Add account…",
+                             #selector(addAccount))
+        submenu.addItem(add)
+
+        let removable = manager.accounts.filter { $0.account.kind == .managed }
+        if !removable.isEmpty {
+            submenu.addItem(.separator())
+            for state in removable {
+                let item = actionItem("Remove \(state.account.label)…", #selector(removeAccount(_:)))
+                item.representedObject = state.id
+                submenu.addItem(item)
+            }
+        }
+
+        let item = NSMenuItem(title: "Accounts", action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
     /// The headline: how today's spending compares to the day's slice of the weekly limit.
-    private func addPaceSection(to menu: NSMenu, usage: UsageData, all: Double) {
+    private func addPaceSection(to menu: NSMenu, usage: UsageData, all: Double, legend: Bool) {
         guard let expected = usage.expectedPercent,
               let ahead = usage.dayDeviationPercent,
               let day = usage.weekDayIndex else { return }
@@ -156,11 +232,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(infoItem(verdict, small: true))
         menu.addItem(infoItem(String(format: "Day %d/7, %.0f%% into the day", day, usage.dayProgressPercent ?? 0),
                               small: true))
-        menu.addItem(infoItem(String(format: "Orange once ahead, red past +%.0f%%, green at −%.1f%% (a day in hand)",
-                                     3.0, dailyAllowancePercent),
-                              small: true))
+        if legend {
+            menu.addItem(infoItem(Self.legend, small: true))
+        }
         menu.addItem(.separator())
     }
+
+    /// What the colours mean — shown once, however many accounts there are.
+    private static let legend = String(format: "Orange once ahead, red past +%.0f%%, green at −%.1f%% (a day in hand)",
+                                       3.0, dailyAllowancePercent)
 
     private func addWeeklySection(to menu: NSMenu, usage: UsageData, all: Double) {
         menu.addItem(infoItem("Weekly (all models): \(Int(all))% used", bold: true))
@@ -252,6 +332,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showLogin() { usageManager.showLogin() }
     @objc private func toggleKeepAwake() { keepAwake.toggle() }
     @objc private func showMonthlyReport() { monthlyReport.show() }
+    @objc private func addAccount() { usageManager.addAccount() }
+    @objc private func toggleMenuBar(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        usageManager.toggleMenuBar(id)
+    }
+    @objc private func removeAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        usageManager.removeAccount(id)
+    }
     @objc private func openUsagePage() { NSWorkspace.shared.open(usagePageURL) }
     @objc private func quit() { NSApplication.shared.terminate(nil) }
 }

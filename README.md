@@ -40,6 +40,25 @@ The figures stay in the menu bar while they are being refreshed and across
 restarts. Once they are more than 15 minutes old they dim and the sparkle turns
 into a warning triangle.
 
+## Several subscriptions
+
+Signed in to more than one Claude account? Each gets its own pair in the menu
+bar — `✦ 64%·68% │ 0%·30%` — and its own section in the menu, in the same order.
+
+- **Found on their own:** besides `~/.claude`, every `~/.claude*` folder that
+  Claude Code is signed in to — the kind an alias such as
+  `CLAUDE_CONFIG_DIR=~/.claude2 claude` sets up. A folder signed in to an
+  account already listed is skipped.
+- **Accounts → Add account…** signs another account in without any of that:
+  the app runs `claude auth login` into a folder of its own and opens the
+  sign-in page in a private window, so the account already signed in to your
+  browser doesn't get in the way. **Remove …** in the same menu signs it out
+  again.
+- **Accounts → Show in menu bar** picks which of them the menu bar shows.
+
+Additional accounts are read through Claude Code only; the claude.ai fallback
+below covers the standard account.
+
 ## Where the figures come from
 
 1. **Claude Code** — `claude -p /usage` reports the plan limits straight from
@@ -63,7 +82,7 @@ been away for more than 10 minutes.
 
 ### Download
 
-1. Download `ClaudeUsage-1.0.zip` from [Releases](https://github.com/ACiDekCZ/claude-usage/releases).
+1. Download `ClaudeUsage-1.1.zip` from [Releases](https://github.com/ACiDekCZ/claude-usage/releases).
 2. Unzip it and move **ClaudeUsage.app** to Applications.
 3. The app is not notarized, so on the first launch macOS refuses to open it:
    open **System Settings → Privacy & Security** and click **Open Anyway**.

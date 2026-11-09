@@ -9,11 +9,14 @@ enum Subprocess {
     enum Failure: LocalizedError {
         case notFound(String)
         case exited(tool: String, status: Int32, stderr: String)
+        case timedOut(tool: String, after: TimeInterval)
 
         var errorDescription: String? {
             switch self {
             case .notFound(let tool):
                 return "\(tool) not found"
+            case .timedOut(let tool, let after):
+                return "\(tool) took longer than \(Int(after)) s"
             case .exited(let tool, let status, let stderr):
                 return "\(tool) exited \(status): \(stderr.prefix(200))"
             }
@@ -44,10 +47,25 @@ enum Subprocess {
         return dir
     }
 
+    /// The environment a spawned tool runs with. A GUI app doesn't inherit the
+    /// shell PATH, and these tools spawn helpers of their own that need to be
+    /// found. `overrides` sets a variable, or removes it when the value is nil.
+    static func environment(for executable: URL,
+                            overrides: [String: String?] = [:]) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let binDir = executable.deletingLastPathComponent().path
+        environment["PATH"] = "\(binDir):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        for (key, value) in overrides {
+            environment[key] = value
+        }
+        return environment
+    }
+
     /// - Returns: everything the tool wrote to stdout.
     static func run(_ executable: URL,
                     _ arguments: [String],
                     workingDirectory: URL,
+                    environment overrides: [String: String?] = [:],
                     timeout: TimeInterval) async throws -> String {
         let tool = executable.lastPathComponent
 
@@ -55,13 +73,7 @@ enum Subprocess {
             let process = Process()
             process.executableURL = executable
             process.arguments = arguments
-
-            // A GUI app doesn't inherit the shell PATH, and these tools spawn
-            // helpers of their own that need to be found.
-            var environment = ProcessInfo.processInfo.environment
-            let binDir = executable.deletingLastPathComponent().path
-            environment["PATH"] = "\(binDir):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-            process.environment = environment
+            process.environment = environment(for: executable, overrides: overrides)
             process.currentDirectoryURL = workingDirectory
 
             let out = Pipe(), err = Pipe()
@@ -69,8 +81,12 @@ enum Subprocess {
             process.standardError = err
             try process.run()
 
+            let timedOut = TimeoutFlag()
             let watchdog = DispatchWorkItem {
-                if process.isRunning { process.terminate() }
+                if process.isRunning {
+                    timedOut.set()
+                    process.terminate()
+                }
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
@@ -81,6 +97,7 @@ enum Subprocess {
             process.waitUntilExit()
             watchdog.cancel()
 
+            if timedOut.isSet { throw Failure.timedOut(tool: tool, after: timeout) }
             guard process.terminationStatus == 0 else {
                 throw Failure.exited(tool: tool,
                                      status: process.terminationStatus,
@@ -89,4 +106,13 @@ enum Subprocess {
             return String(data: outData, encoding: .utf8) ?? ""
         }.value
     }
+}
+
+/// Set by the watchdog when it has to stop a tool, read once the tool is gone.
+private final class TimeoutFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func set() { lock.lock(); value = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
