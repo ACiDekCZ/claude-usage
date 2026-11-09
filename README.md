@@ -47,8 +47,8 @@ bar — `✦ 64%·68% │ 0%·30%` — and its own section in the menu, in the s
 
 - **Found on their own:** besides `~/.claude`, every `~/.claude*` folder that
   Claude Code is signed in to — the kind an alias such as
-  `CLAUDE_CONFIG_DIR=~/.claude2 claude` sets up. A folder signed in to an
-  account already listed is skipped.
+  `CLAUDE_CONFIG_DIR=~/.claude2 claude` sets up. Two folders signed in to
+  the same address are both listed, each labelled with its folder.
 - **Accounts → Add account…** signs another account in without any of that:
   the app runs `claude auth login` into a folder of its own and opens the
   sign-in page in a private window, so the account already signed in to your
