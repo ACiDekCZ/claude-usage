@@ -61,10 +61,12 @@ below covers the standard account.
 
 ## Where the figures come from
 
-1. **Claude Code** — `claude -p /usage` reports the plan limits straight from
-   the server. It is a built-in command: no model call, no tokens used. It runs
-   in a folder of its own, so macOS has no reason to ask for access to your
-   Desktop or Documents.
+1. **Claude Code** — its `get_usage` request (one line of JSON on stdin of
+   `claude -p --input-format stream-json`) reports the plan limits straight
+   from the server in a second or two: no model call, no tokens used, and none
+   of the conversations kept on your Mac read — `claude -p /usage` sums those
+   up as well, which takes a minute and more. It runs in a folder of its own,
+   so macOS has no reason to ask for access to your Desktop or Documents.
 2. **claude.ai** — if the CLI isn't there, the app reads the usage page in a
    hidden web view. It signs in with your Chrome session (macOS asks once for
    access to "Chrome Safe Storage" in the keychain) or through a login window.
@@ -82,7 +84,7 @@ been away for more than 10 minutes.
 
 ### Download
 
-1. Download `ClaudeUsage-1.1.zip` from [Releases](https://github.com/ACiDekCZ/claude-usage/releases).
+1. Download `ClaudeUsage-1.1.1.zip` from [Releases](https://github.com/ACiDekCZ/claude-usage/releases).
 2. Unzip it and move **ClaudeUsage.app** to Applications.
 3. The app is not notarized, so on the first launch macOS refuses to open it:
    open **System Settings → Privacy & Security** and click **Open Anyway**.
@@ -106,7 +108,8 @@ cp -R ClaudeUsage.app /Applications/
 
 ## clu — the same figures in the terminal
 
-`cli/clu` is a small Python 3.9+ script around the same `claude -p /usage` call.
+`cli/clu` is a small Python 3.9+ script around the same `get_usage` request
+(with an older Claude Code that doesn't know it, `claude -p /usage`).
 
 ```bash
 ln -s "$PWD/cli/clu" ~/.local/bin/clu
@@ -125,7 +128,7 @@ Week      18%  ███·············  resets in 4d 20h  (Wed 7 Oct
 Pace      18% used vs 30.8% of the week gone  12.8% behind the line
 ```
 
-`--json` gives machine-readable output, `--raw` passes the CLI's output through
+`--json` gives machine-readable output, `--raw` prints Claude Code's answer
 unchanged.
 
 ## Privacy

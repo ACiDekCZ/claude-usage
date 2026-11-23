@@ -109,21 +109,6 @@ struct UsageData {
 /// One day's share of the weekly limit (100 % / 7 days ≈ 14.3 %).
 let dailyAllowancePercent: Double = 100.0 / 7.0
 
-extension String {
-    /// Full match plus capture groups, or nil when the pattern doesn't match.
-    /// Optional groups that didn't participate come back as empty strings.
-    func captures(_ pattern: String, caseInsensitive: Bool = false) -> [String]? {
-        let options: NSRegularExpression.Options = caseInsensitive ? [.caseInsensitive] : []
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: options),
-              let match = regex.firstMatch(in: self, range: NSRange(startIndex..., in: self))
-        else { return nil }
-        return (0..<match.numberOfRanges).map { index in
-            guard let range = Range(match.range(at: index), in: self) else { return "" }
-            return String(self[range])
-        }
-    }
-}
-
 /// Runs the Claude Code CLI to read the plan limits.
 enum ClaudeCLI {
     /// A GUI app doesn't inherit the shell PATH, so look where it actually lands.
@@ -136,15 +121,102 @@ enum ClaudeCLI {
         ])
     }
 
-    /// Generous: besides the limits, `/usage` now sums up the local session
-    /// history ("What's contributing to your usage?"), which on a busy Mac
-    /// takes minutes rather than seconds.
-    static func usageText(for account: ClaudeAccount, timeout: TimeInterval = 300) async throws -> String {
+    enum Problem: LocalizedError {
+        /// A Claude Code too old to know the request.
+        case unsupported(String)
+        /// Signed out, or signed in with an API key: no plan limits to show.
+        case noLimits
+        case noAnswer
+
+        var errorDescription: String? {
+            switch self {
+            case .unsupported(let reason): return "Update Claude Code (\(reason.prefix(60)))"
+            case .noLimits: return "Not signed in to a Claude plan"
+            case .noAnswer: return "claude gave no usage figures"
+            }
+        }
+    }
+
+    /// The plan's limits, asked with the control request `get_usage` on
+    /// stdin of `claude -p --input-format stream-json`. With `skip_behaviors`
+    /// it reports the limits alone, straight from the server, in a second or
+    /// two, without calling a model. `claude -p /usage` would also sum up
+    /// every conversation kept on the Mac from the past week ("What's
+    /// contributing to your usage?"), which takes a minute and more on a busy
+    /// one — and nothing here shows that breakdown.
+    static func limits(for account: ClaudeAccount, timeout: TimeInterval = 60) async throws -> PlanLimits {
         guard let binary = locate() else { throw Subprocess.Failure.notFound("claude CLI") }
-        return try await Subprocess.run(binary, ["-p", "/usage"],
-                                       workingDirectory: Subprocess.scratchDirectory("cli"),
-                                       environment: account.cliEnvironment,
-                                       timeout: timeout)
+        let id = "claude-usage-\(UUID().uuidString)"
+        let request = #"{"type":"control_request","request_id":"\#(id)","request":{"subtype":"get_usage","skip_behaviors":true}}"#
+        let output = try await Subprocess.run(binary,
+                                              ["-p", "--input-format", "stream-json",
+                                               "--output-format", "stream-json", "--verbose"],
+                                              workingDirectory: Subprocess.scratchDirectory("cli"),
+                                              environment: account.cliEnvironment,
+                                              input: request + "\n",
+                                              timeout: timeout)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        for line in output.split(separator: "\n") where line.contains(id) {
+            guard let reply = try? decoder.decode(ControlLine.self, from: Data(line.utf8)),
+                  reply.type == "control_response",
+                  let response = reply.response, response.requestId == id else { continue }
+            guard response.subtype == "success" else {
+                throw Problem.unsupported(response.error ?? "get_usage failed")
+            }
+            guard let limits = response.response,
+                  limits.rateLimitsAvailable == true, limits.rateLimits != nil else {
+                throw Problem.noLimits
+            }
+            return limits
+        }
+        throw Problem.noAnswer
+    }
+
+    /// One line of the stream-json output; only the answer to our request is read.
+    private struct ControlLine: Decodable {
+        struct Response: Decodable {
+            let subtype: String?
+            let requestId: String?
+            let response: PlanLimits?
+            let error: String?
+        }
+        let type: String?
+        let response: Response?
+    }
+}
+
+/// What `get_usage` reports: utilization 0–100 and the reset moment of each
+/// window (none for a window not begun yet).
+struct PlanLimits: Decodable {
+    struct Window: Decodable {
+        let utilization: Double?
+        let resetsAt: String?
+    }
+    struct ModelWindow: Decodable {
+        let displayName: String?
+        let utilization: Double?
+        let resetsAt: String?
+    }
+    struct RateLimits: Decodable {
+        let fiveHour: Window?
+        let sevenDay: Window?
+        /// Weekly limits of a single model, e.g. "Fable".
+        let modelScoped: [ModelWindow]?
+    }
+
+    let rateLimitsAvailable: Bool?
+    let rateLimits: RateLimits?
+
+    /// "2026-11-25T12:00:00.073795+00:00" — microseconds, which
+    /// ISO8601DateFormatter won't take, so the fraction is dropped.
+    static func date(_ text: String?) -> Date? {
+        guard let text else { return nil }
+        let trimmed = text.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: trimmed)
     }
 }
 
@@ -495,14 +567,11 @@ class UsageManager: NSObject, ObservableObject {
 
     // MARK: - Public actions
 
-    /// Prefers the Claude Code CLI: `claude -p /usage` reports the plan limits
-    /// straight from the server, costs nothing (no model call — measured at zero
-    /// tokens and zero turns), needs no cookies, and gives the reset moment as a
-    /// real date with a timezone instead of a bare weekday. Every account is
-    /// read this way, one after another — each run walks the local session
-    /// history, and several at once only slow each other down. Only the
-    /// standard one falls back to scraping the settings page if the CLI isn't
-    /// usable.
+    /// Prefers the Claude Code CLI: its `get_usage` request reports the plan
+    /// limits straight from the server in a second or two, costs nothing (no
+    /// model call), needs no cookies, and gives each reset as an exact moment.
+    /// Every account is read this way, one after another. Only the standard
+    /// one falls back to scraping the settings page if the CLI isn't usable.
     func fetchUsage() {
         guard !isFetching else {
             DebugLog.log("fetchUsage skipped, already fetching")
@@ -530,14 +599,14 @@ class UsageManager: NSObject, ObservableObject {
 
         var failure: String
         do {
-            let text = try await ClaudeCLI.usageText(for: account)
+            let limits = try await ClaudeCLI.limits(for: account)
             update(id) { $0.isFetching = false }
-            if let data = parseCLIOutput(text) {
+            if let data = usageData(from: limits) {
                 publish(data, for: id, source: "cli")
                 return
             }
-            DebugLog.log("CLI output for \(account.label) had no usage figures: \(String(text.prefix(200)))")
-            failure = Self.cliProblem(in: text)
+            DebugLog.log("get_usage for \(account.label) had no usage figures")
+            failure = ClaudeCLI.Problem.noAnswer.localizedDescription
         } catch Subprocess.Failure.timedOut(let tool, let after) {
             // Slow, not broken: claude.ai wouldn't do better, so keep what we
             // have and try again next round.
@@ -559,16 +628,6 @@ class UsageManager: NSObject, ObservableObject {
         } else {
             update(id) { $0.markFailed(failure) }
         }
-    }
-
-    /// A short reason for output that carried no figures.
-    private static func cliProblem(in text: String) -> String {
-        let lower = text.lowercased()
-        if lower.contains("log in") || lower.contains("login") || lower.contains("not logged") {
-            return "Not signed in"
-        }
-        let firstLine = text.split(separator: "\n").first.map(String.init) ?? ""
-        return firstLine.isEmpty ? "claude gave no usage figures" : String(firstLine.prefix(80))
     }
 
     /// Whether the standard account's claude.ai read is in flight.
@@ -944,81 +1003,29 @@ class UsageManager: NSObject, ObservableObject {
         startRefreshTimer()
     }
 
-    // MARK: - CLI parsing
+    // MARK: - CLI figures
 
-    /// Reads the three figures out of `claude -p /usage`:
-    ///
-    ///     Current session: 12% used · resets Aug 6 at 11am (Europe/Prague)
-    ///     Current week (all models): 9% used · resets Aug 12 at 2pm (Europe/Prague)
-    ///     Current week (Fable): 0% used
-    ///
-    /// Returns nil if none of them were found, so the caller can fall back.
-    private func parseCLIOutput(_ text: String) -> UsageData? {
+    /// The figures shown, from what `get_usage` reported. Nil when it gave
+    /// neither the session nor the week.
+    private func usageData(from limits: PlanLimits) -> UsageData? {
+        guard let rates = limits.rateLimits else { return nil }
         var data = UsageData()
-        data.rawText = text
-
-        for line in text.components(separatedBy: .newlines) {
-            let line = line.trimmingCharacters(in: .whitespaces)
-
-            if let m = line.captures(#"^Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s+(.+))?$"#) {
-                data.currentSessionPercent = Double(m[1])
-                data.currentSessionReset = m.count > 2 && !m[2].isEmpty ? m[2] : nil
-            } else if let m = line.captures(#"^Current week \(([^)]+)\):\s*(\d+)%\s*used(?:\s*·\s*resets\s+(.+))?$"#) {
-                let name = m[1]
-                let percent = Double(m[2])
-                let reset = m.count > 3 && !m[3].isEmpty ? m[3] : nil
-                if name.lowercased() == "all models" {
-                    data.allModelsPercent = percent
-                    data.allModelsReset = reset
-                } else if data.sonnetPercent == nil {
-                    data.sonnetLabel = name
-                    data.sonnetPercent = percent
-                }
-            }
+        if let session = rates.fiveHour, let used = session.utilization {
+            data.currentSessionPercent = used
+            data.currentSessionResetDate = PlanLimits.date(session.resetsAt)
         }
-
+        if let week = rates.sevenDay, let used = week.utilization {
+            data.allModelsPercent = used
+            data.allModelsResetDate = PlanLimits.date(week.resetsAt)
+        }
+        if let model = rates.modelScoped?.first, let used = model.utilization {
+            data.sonnetLabel = model.displayName
+            data.sonnetPercent = used
+        }
         guard data.allModelsPercent != nil || data.currentSessionPercent != nil else { return nil }
 
-        let now = Date()
-        data.currentSessionResetDate = data.currentSessionReset.flatMap { Self.parseCLIReset($0, now: now) }
-        data.allModelsResetDate = data.allModelsReset.flatMap { Self.parseCLIReset($0, now: now) }
-
-        applyPacing(to: &data, now: now)
+        applyPacing(to: &data, now: Date())
         return data
-    }
-
-    /// "Aug 12 at 2pm (Europe/Prague)" — minutes are dropped on the hour, and the
-    /// year is absent, so pick the nearest year that still lies ahead of now.
-    static func parseCLIReset(_ text: String, now: Date) -> Date? {
-        guard let m = text.captures(#"^(\w{3})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)$"#,
-                                    caseInsensitive: true),
-              let day = Int(m[2]), let rawHour = Int(m[3]) else { return nil }
-
-        let months = ["jan", "feb", "mar", "apr", "may", "jun",
-                      "jul", "aug", "sep", "oct", "nov", "dec"]
-        guard let month = months.firstIndex(of: m[1].lowercased())
-                .map({ $0 + 1 }) else { return nil }
-
-        let minute = Int(m[4]) ?? 0
-        let hour = rawHour % 12 + (m[5].lowercased() == "pm" ? 12 : 0)
-
-        var calendar = Calendar(identifier: .gregorian)
-        guard let tz = TimeZone(identifier: m[6]) else { return nil }
-        calendar.timeZone = tz
-
-        let thisYear = calendar.component(.year, from: now)
-        for year in [thisYear, thisYear + 1, thisYear - 1] {
-            var components = DateComponents()
-            components.year = year
-            components.month = month
-            components.day = day
-            components.hour = hour
-            components.minute = minute
-            guard let date = calendar.date(from: components) else { continue }
-            // Resets lie ahead; allow a day of slack for clock skew.
-            if date > now.addingTimeInterval(-86_400) { return date }
-        }
-        return nil
     }
 
     /// Turns a reset string from the usage page into an absolute date.

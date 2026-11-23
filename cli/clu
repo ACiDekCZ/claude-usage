@@ -3,9 +3,11 @@
 
 Prints the three figures that matter by default; --full for the detail.
 
-Wraps `claude -p /usage`, which reports the plan limits straight from the
-server, and adds the pacing figure: where an even spread across the week
-would have you right now.
+Asks Claude Code for the plan limits with its `get_usage` control request,
+which reports them straight from the server in a second or two, and adds the
+pacing figure: where an even spread across the week would have you right now.
+An older Claude Code that doesn't know the request is asked `claude -p /usage`,
+which also reads every conversation kept on the computer and takes longer.
 """
 
 import argparse
@@ -14,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -48,6 +51,80 @@ class Colour:
 
     def red(self, t):
         return self(t, "31")
+
+
+class Unsupported(Exception):
+    """Claude Code answered get_usage with an error: too old to know it."""
+
+
+def run_get_usage(timeout):
+    """The `get_usage` answer (a dict), or None when it had no plan limits.
+    Raises Unsupported for a Claude Code that doesn't know the request."""
+    request_id = f"clu-{uuid.uuid4()}"
+    request = {"type": "control_request", "request_id": request_id,
+               "request": {"subtype": "get_usage", "skip_behaviors": True}}
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "--input-format", "stream-json",
+             "--output-format", "stream-json", "--verbose"],
+            input=json.dumps(request) + "\n",
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        sys.exit("clu: `claude` not found on PATH")
+    except subprocess.TimeoutExpired:
+        sys.exit(f"clu: claude didn't answer within {timeout}s")
+    for raw in proc.stdout.splitlines():
+        if request_id not in raw:
+            continue
+        try:
+            line = json.loads(raw)
+        except ValueError:
+            continue
+        res = line.get("response") or {}
+        if line.get("type") != "control_response" or res.get("request_id") != request_id:
+            continue
+        if res.get("subtype") != "success":
+            raise Unsupported(res.get("error") or "get_usage failed")
+        answer = res.get("response") or {}
+        if answer.get("rate_limits_available") is not True or not answer.get("rate_limits"):
+            return None
+        return answer
+    raise Unsupported(f"no answer to get_usage (exit {proc.returncode})")
+
+
+def parse_iso(text):
+    if not text:
+        return None
+    try:
+        # "2026-11-25T12:00:00.073795+00:00" — fromisoformat takes it from 3.11;
+        # dropping the fraction keeps 3.9 happy.
+        return datetime.fromisoformat(re.sub(r"\.\d+", "", text)).astimezone()
+    except ValueError:
+        return None
+
+
+def from_get_usage(answer):
+    """The same shape parse() gives, from the get_usage answer."""
+    rates = answer["rate_limits"]
+    data = {"session": None, "limits": [], "raw": json.dumps(answer, indent=2)}
+
+    def item(name, window, used_key="utilization"):
+        reset = parse_iso(window.get("resets_at"))
+        return {"name": name, "percent": round(window[used_key]), "reset": reset,
+                "reset_text": reset.strftime("%a %-d %b, %H:%M") if reset else None}
+
+    session = rates.get("five_hour")
+    if session and session.get("utilization") is not None:
+        data["session"] = item("session", session)
+        del data["session"]["name"]
+    week = rates.get("seven_day")
+    if week and week.get("utilization") is not None:
+        data["limits"].append(item("all models", week))
+    for model in rates.get("model_scoped") or []:
+        if model.get("utilization") is not None:
+            data["limits"].append(item(model.get("display_name") or "model", model))
+    return data
 
 
 def run_claude(timeout):
@@ -233,22 +310,34 @@ def main():
     ap.add_argument("--full", "--long", action="store_true", dest="full",
                     help="every limit, with bars, reset times and the pace line")
     ap.add_argument("--raw", action="store_true",
-                    help="print `claude -p /usage` output unchanged")
+                    help="print Claude Code's answer unchanged")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--timeout", type=int, default=60,
                     help="seconds to wait for claude (default 60)")
     args = ap.parse_args()
 
-    text = run_claude(args.timeout)
-    if args.raw:
-        sys.stdout.write(text)
-        return
-
     now = datetime.now().astimezone()
-    data = parse(text, now)
+    try:
+        answer = run_get_usage(args.timeout)
+    except Unsupported:
+        answer = False
+    if answer is None:
+        sys.exit("clu: no plan limits — is Claude Code signed in to a Claude plan?")
+
+    if answer:
+        data = from_get_usage(answer)
+        if args.raw:
+            print(data["raw"])
+            return
+    else:
+        text = run_claude(args.timeout)
+        if args.raw:
+            sys.stdout.write(text)
+            return
+        data = parse(text, now)
     if data["session"] is None and not data["limits"]:
         sys.stderr.write("clu: could not find usage figures in claude's output\n")
-        sys.stdout.write(text)
+        sys.stdout.write(data["raw"])
         sys.exit(1)
 
     if args.json:

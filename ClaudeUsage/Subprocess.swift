@@ -61,11 +61,13 @@ enum Subprocess {
         return environment
     }
 
+    /// - Parameter input: written to the tool's stdin, which is then closed.
     /// - Returns: everything the tool wrote to stdout.
     static func run(_ executable: URL,
                     _ arguments: [String],
                     workingDirectory: URL,
                     environment overrides: [String: String?] = [:],
+                    input: String? = nil,
                     timeout: TimeInterval) async throws -> String {
         let tool = executable.lastPathComponent
 
@@ -79,7 +81,13 @@ enum Subprocess {
             let out = Pipe(), err = Pipe()
             process.standardOutput = out
             process.standardError = err
+            let stdin = input.map { _ in Pipe() }
+            process.standardInput = stdin ?? FileHandle.nullDevice
             try process.run()
+            if let stdin, let input {
+                try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+                try? stdin.fileHandleForWriting.close()
+            }
 
             let timedOut = TimeoutFlag()
             let watchdog = DispatchWorkItem {
